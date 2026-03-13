@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.pkl
+*.log
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Results / artifacts
+results/
+*.csv
+*.parquet
+
+# Secrets / local config
+.env

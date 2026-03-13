@@ -1,0 +1,14 @@
+{
+  "level": "utah",
+  "anchor": {
+    "name": "spawn_west_highway",
+    "pos": [-922.1, -929.8, 135.53],
+    "yaw_deg": -110.2
+  },
+  "ego": {
+    "lane_center_offset_m": 1.7
+  },
+  "lead": {
+    "gap_m": 40.0
+  }
+}
