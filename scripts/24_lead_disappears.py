@@ -27,7 +27,7 @@ EGO_ACC_TARGET_KPH = 80.0
 # TIMING
 # -----------------------------
 DT = 0.1
-MAX_TIME_S = 75.0
+MAX_TIME_S = 60.0
 LEAD_SPEED_AWAY_AT_S = 30.0
 
 # ACC should only be requested once ego is up to speed manually

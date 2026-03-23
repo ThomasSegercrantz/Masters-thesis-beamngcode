@@ -19,8 +19,8 @@ YAW_DEG = -90.203
 # -----------------------------
 # CORE SPEED SETTINGS
 # -----------------------------
-LEAD_SPEED_KPH_INITIAL = 60.0
-LEAD_SPEED_KPH_FINAL = 30.0
+LEAD_SPEED_KPH_INITIAL = 70.0
+LEAD_SPEED_KPH_FINAL = 45.0
 EGO_ACC_TARGET_KPH = 80.0
 
 # -----------------------------

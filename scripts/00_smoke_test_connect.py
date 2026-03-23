@@ -3,7 +3,7 @@ from scripts.common import get_settings
 
 def main():
     s = get_settings()
-    bng = BeamNGpy(s.host, s.port, home=s.beamng_home)
+    bng = BeamNGpy(s.host, s.port, home=s.home)
     bng.open(launch=True)
     print("✅ Connected to BeamNG.tech")
     bng.close()

@@ -20,9 +20,9 @@ env/
 Thumbs.db
 
 # Results / artifacts
-results/
-*.csv
-*.parquet
+#results/
+#*.csv
+#*.parquet
 
 # Secrets / local config
 .env

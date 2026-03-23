@@ -3,102 +3,30 @@
 BeamNG.tech ACC experiment analysis
 ===================================
 
-This script reads all telemetry CSV logs in:
+Reads all telemetry CSV logs in:
   results/raw/*.csv
 
-and produces:
-  results/summary/summary_metrics.csv
+Produces by default:
+  1) results/summary/summary_metrics.csv              -> one combined summary for all runs
+  2) results/summary/<run_name>_summary.csv          -> one summary CSV per run
 
-It is designed to work with the standardized logger you added in common.py
-(BeamNGTelemetryLogger). The CSVs are expected to have commented metadata
-lines at the top (starting with '#') and a consistent set of columns such as:
+Optional:
+  3) results/summary/plots/<run_name>.png            -> one plot per run (if --make_plots)
 
-  time_s, ego_speed_mps, ego_accel_mps2, lead_speed_mps, lead_accel_mps2,
-  gap_m, relative_speed_mps, ego_throttle, ego_brake, ego_steering,
-  ego_pos_x, ego_pos_y, ego_pos_z, lead_pos_x, lead_pos_y, lead_pos_z
+Usage examples
+--------------
+From repo root:
 
-------------------------------------------------------------
-Glossary / metric definitions (used in your scenario table)
-------------------------------------------------------------
+  python scripts/analyze_runs.py
 
-Speed (m/s, km/h)
-  Vehicle forward speed magnitude. (We use the magnitude of velocity provided
-  by BeamNG/BeamNGpy telemetry; your logger already stores speed in m/s.)
-
-Relative speed (ego - lead)
-  relative_speed_mps = ego_speed_mps - lead_speed_mps
-  Positive means the ego is closing in on the lead (ego faster than lead).
-
-Gap (m)
-  Euclidean distance between ego and lead positions:
-    gap_m = ||ego_pos - lead_pos||
-  Note: this is not strictly "bumper-to-bumper" distance, but it is a good
-  proxy if vehicles are aligned in-lane.
-
-Headway (s)
-  A standard ACC metric: "time gap" to the lead, computed as:
-    headway_s = gap_m / max(ego_speed_mps, eps)
-  Interpretation:
-    - 1.0 s: aggressive following
-    - 1.5 s: typical ACC
-    - 2.0+ s: conservative following
-
-RMS (Root Mean Square)
-  RMS measures magnitude of a signal over time:
-    RMS(x) = sqrt(mean(x^2))
-  We use it for relative speed stability:
-    rel_speed_rms_mps = RMS(relative_speed_mps)
-  Lower is better (more stable matching of lead speed).
-
-Acceleration peak (m/s^2)
-  Maximum absolute longitudinal acceleration magnitude from the logged
-  ego_accel_mps2:
-    accel_peak_mps2 = max(abs(ego_accel_mps2))
-  We also report max braking (most negative accel):
-    max_decel_mps2 = min(ego_accel_mps2)
-
-Jerk peak (m/s^3) (proxy)
-  Jerk is the derivative of acceleration. With discrete logs:
-    jerk ~= d(accel)/dt ~= Delta(accel) / Delta(t)
-  Higher jerk often correlates with lower comfort.
-
-TTC proxy (Time-To-Collision proxy)
-  Classic TTC is gap / closing_speed when closing_speed > 0.
-  Here we compute:
-    ttc_proxy_s = gap_m / max(relative_speed_mps, eps)   (only where rel_speed > 0)
-  We report min TTC proxy across the run. Lower values indicate higher risk.
-  This is a proxy because it uses Euclidean gap, not exact longitudinal distance.
-
-Collision flag
-  A simple boolean indicating a "likely collision" event:
-    collision_flag = (min_gap_m < COLLISION_GAP_M)
-  Since we don't have bumper geometry, choose a conservative threshold
-  (default 5 m). Adjust as needed.
-
-Notes on event-timed metrics (settling time, reaction time, rise time)
-  Some scenario-table metrics require knowing the time of an external event
-  (e.g., "lead brakes at t=25s"). Your current CSV logs do not yet include
-  explicit event markers. This script computes robust "always available"
-  metrics from the telemetry alone, and computes a few event-style proxies
-  when possible. If you later add an "event" column to the logger, the script
-  can be extended to compute those event metrics precisely.
-
-------------------------------------------------------------
-Usage
-------------------------------------------------------------
-
-From your repo root (where results/ exists):
-
-  python analyze_runs.py
-
-Optional flags:
-  --raw_dir results/raw
-  --summary_dir results/summary
-  --collision_gap_m 5.0
+Optional:
+  python scripts/analyze_runs.py --make_plots
+  python scripts/analyze_runs.py --raw_dir results/raw --summary_dir results/summary
 """
+
 import argparse
-from pathlib import Path
 import math
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -127,6 +55,16 @@ def rms(x: np.ndarray) -> float:
     return float(np.sqrt(np.mean(x * x)))
 
 
+def safe_stem(path: Path) -> str:
+    """
+    Sanitized stem for output filenames.
+    """
+    s = path.stem
+    for ch in [" ", ":", "/", "\\"]:
+        s = s.replace(ch, "_")
+    return s
+
+
 def compute_metrics(df: pd.DataFrame, meta: dict, collision_gap_m: float) -> dict:
     out = {}
     out["file"] = meta.get("File", "")
@@ -134,7 +72,6 @@ def compute_metrics(df: pd.DataFrame, meta: dict, collision_gap_m: float) -> dic
     out["date"] = meta.get("Date", "")
     out["description"] = meta.get("Description", "")
 
-    # Targets if present
     acc_target_kph = None
     lead_target_kph = None
     try:
@@ -144,36 +81,37 @@ def compute_metrics(df: pd.DataFrame, meta: dict, collision_gap_m: float) -> dic
             lead_target_kph = float(meta["Lead target (kph)"])
     except Exception:
         pass
+
     out["acc_target_kph"] = acc_target_kph
     out["lead_target_kph"] = lead_target_kph
 
-    # Duration
     out["duration_s"] = float(df["time_s"].max())
 
     ego_kph = df["ego_speed_mps"] * 3.6
     lead_kph = df["lead_speed_mps"] * 3.6
 
-    # Basic speed stats
     out["ego_speed_max_kph"] = float(ego_kph.max())
     out["ego_speed_mean_kph"] = float(ego_kph.mean())
     out["ego_speed_min_kph"] = float(ego_kph.min())
+
     out["lead_speed_max_kph"] = float(lead_kph.max())
     out["lead_speed_mean_kph"] = float(lead_kph.mean())
     out["lead_speed_min_kph"] = float(lead_kph.min())
 
-    # Gap stats
     gap = df["gap_m"]
     out["gap_min_m"] = float(gap.min())
     out["gap_mean_m"] = float(gap.mean())
     out["gap_max_m"] = float(gap.max())
 
-    # Relative speed RMS (moving only)
-    moving = df["ego_speed_mps"] > 5.0  # > 18 km/h
+    moving = df["ego_speed_mps"] > 5.0
     rel_m = df.loc[moving, "relative_speed_mps"].to_numpy(dtype=float)
     out["rel_speed_rms_mps"] = rms(rel_m)
-    out["rel_speed_rms_kph"] = out["rel_speed_rms_mps"] * 3.6 if not math.isnan(out["rel_speed_rms_mps"]) else float("nan")
+    out["rel_speed_rms_kph"] = (
+        out["rel_speed_rms_mps"] * 3.6
+        if not math.isnan(out["rel_speed_rms_mps"])
+        else float("nan")
+    )
 
-    # Headway (moving only)
     ego_mps = df["ego_speed_mps"].to_numpy(dtype=float)
     gap_m = df["gap_m"].to_numpy(dtype=float)
     headway = np.full_like(ego_mps, np.nan, dtype=float)
@@ -183,7 +121,6 @@ def compute_metrics(df: pd.DataFrame, meta: dict, collision_gap_m: float) -> dic
     out["headway_min_s"] = float(np.nanmin(headway))
     out["headway_max_s"] = float(np.nanmax(headway))
 
-    # Accel & jerk
     a = df["ego_accel_mps2"].to_numpy(dtype=float)
     out["ego_accel_peak_mps2"] = float(np.nanmax(np.abs(a)))
     out["ego_max_decel_mps2"] = float(np.nanmin(a))
@@ -197,7 +134,6 @@ def compute_metrics(df: pd.DataFrame, meta: dict, collision_gap_m: float) -> dic
     else:
         out["ego_jerk_peak_mps3"] = float("nan")
 
-    # TTC proxy (min) when closing
     rel_mps = df["relative_speed_mps"].to_numpy(dtype=float)
     ttc = np.full_like(rel_mps, np.nan, dtype=float)
     closing = rel_mps > 0.5
@@ -207,10 +143,8 @@ def compute_metrics(df: pd.DataFrame, meta: dict, collision_gap_m: float) -> dic
     else:
         out["ttc_proxy_min_s"] = float("nan")
 
-    # Collision flag (gap threshold)
     out["collision_flag"] = bool(out["gap_min_m"] < collision_gap_m)
 
-    # Overshoot & steady-state error vs ACC set speed (if known)
     if acc_target_kph is not None:
         err = ego_kph - acc_target_kph
         out["ego_overshoot_kph"] = float(np.max(err))
@@ -226,7 +160,6 @@ def compute_metrics(df: pd.DataFrame, meta: dict, collision_gap_m: float) -> dic
         out["ego_overshoot_kph"] = float("nan")
         out["ego_steady_state_abs_error_kph"] = float("nan")
 
-    # Stop time proxy: first time ego < 0.5 m/s after being > 5 m/s
     out["ego_stop_time_s"] = float("nan")
     was_moving = np.where(ego_mps > 5.0)[0]
     if was_moving.size > 0:
@@ -238,18 +171,102 @@ def compute_metrics(df: pd.DataFrame, meta: dict, collision_gap_m: float) -> dic
     return out
 
 
+def ordered_summary_df(rows: list[dict]) -> pd.DataFrame:
+    out_df = pd.DataFrame(rows)
+
+    preferred = [
+        "file", "script", "date", "description",
+        "acc_target_kph", "lead_target_kph",
+        "duration_s",
+        "ego_speed_mean_kph", "ego_speed_max_kph", "ego_speed_min_kph",
+        "lead_speed_mean_kph", "lead_speed_max_kph", "lead_speed_min_kph",
+        "gap_mean_m", "gap_min_m", "gap_max_m",
+        "headway_mean_s", "headway_min_s", "headway_max_s",
+        "rel_speed_rms_mps", "rel_speed_rms_kph",
+        "ego_accel_peak_mps2", "ego_max_decel_mps2", "ego_jerk_peak_mps3",
+        "ttc_proxy_min_s",
+        "ego_overshoot_kph", "ego_steady_state_abs_error_kph",
+        "ego_stop_time_s",
+        "collision_flag",
+    ]
+    cols = [c for c in preferred if c in out_df.columns] + [c for c in out_df.columns if c not in preferred]
+    return out_df[cols]
+
+
+def write_single_run_summary(summary_path: Path, metrics: dict, collision_gap_m: float) -> None:
+    df = ordered_summary_df([metrics])
+    with summary_path.open("w", encoding="utf-8", newline="") as f:
+        f.write("# BeamNG.tech per-run summary metrics\n")
+        f.write("# Generated by analyze_runs.py\n")
+        f.write(f"# collision_gap_m = {collision_gap_m}\n")
+        df.to_csv(f, index=False)
+
+
+def write_combined_summary(summary_path: Path, rows: list[dict], collision_gap_m: float) -> None:
+    out_df = ordered_summary_df(rows)
+    with summary_path.open("w", encoding="utf-8", newline="") as f:
+        f.write("# BeamNG.tech experiment summary metrics\n")
+        f.write("# Generated by analyze_runs.py\n")
+        f.write(f"# collision_gap_m = {collision_gap_m}\n")
+        out_df.to_csv(f, index=False)
+
+
+def make_run_plot(df: pd.DataFrame, metrics: dict, plot_path: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    t = df["time_s"]
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+
+    axes[0].plot(t, df["ego_speed_mps"] * 3.6, label="Ego speed (km/h)")
+    axes[0].plot(t, df["lead_speed_mps"] * 3.6, label="Lead speed (km/h)")
+    if pd.notna(metrics.get("acc_target_kph")):
+        axes[0].axhline(metrics["acc_target_kph"], linestyle="--", label="ACC target")
+    axes[0].set_ylabel("Speed")
+    axes[0].set_title(metrics.get("file", "Run"))
+    axes[0].legend()
+    axes[0].grid(True)
+
+    axes[1].plot(t, df["gap_m"], label="Gap (m)")
+    axes[1].set_ylabel("Gap")
+    axes[1].legend()
+    axes[1].grid(True)
+
+    axes[2].plot(t, df["relative_speed_mps"], label="Relative speed (m/s)")
+    axes[2].axhline(0.0, linestyle="--")
+    axes[2].set_xlabel("Time (s)")
+    axes[2].set_ylabel("Rel speed")
+    axes[2].legend()
+    axes[2].grid(True)
+
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw_dir", default="results/raw", help="Directory containing raw telemetry CSV files")
     ap.add_argument("--summary_dir", default="results/summary", help="Directory to write summary outputs")
     ap.add_argument("--collision_gap_m", type=float, default=5.0, help="Gap threshold (m) for collision flag")
+    ap.add_argument(
+        "--make_plots",
+        action="store_true",
+        help="If set, generate one PNG plot per run in results/summary/plots",
+    )
     args = ap.parse_args()
 
     raw_dir = Path(args.raw_dir)
     summary_dir = Path(args.summary_dir)
     summary_dir.mkdir(parents=True, exist_ok=True)
 
+    plots_dir = summary_dir / "plots"
+    if args.make_plots:
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
     rows = []
+    processed = 0
+
     for csv_path in sorted(raw_dir.glob("*.csv")):
         meta = parse_metadata(csv_path)
         meta["File"] = csv_path.name
@@ -261,45 +278,37 @@ def main():
             continue
 
         required = {"time_s", "ego_speed_mps", "ego_accel_mps2", "lead_speed_mps", "gap_m", "relative_speed_mps"}
-        if not required.issubset(set(df.columns)):
-            print(f"[WARN] Skipping {csv_path.name}: missing required columns {required - set(df.columns)}")
+        missing = required - set(df.columns)
+        if missing:
+            print(f"[WARN] Skipping {csv_path.name}: missing required columns {missing}")
             continue
 
-        rows.append(compute_metrics(df, meta, collision_gap_m=args.collision_gap_m))
+        metrics = compute_metrics(df, meta, collision_gap_m=args.collision_gap_m)
+        rows.append(metrics)
+        processed += 1
+
+        run_name = safe_stem(csv_path)
+        per_run_summary_path = summary_dir / f"{run_name}_summary.csv"
+        write_single_run_summary(per_run_summary_path, metrics, args.collision_gap_m)
+
+        if args.make_plots:
+            plot_path = plots_dir / f"{run_name}.png"
+            try:
+                make_run_plot(df, metrics, plot_path)
+            except Exception as e:
+                print(f"[WARN] Failed to plot {csv_path.name}: {e}")
 
     if not rows:
         print("No valid CSV logs found.")
         return
 
-    out_df = pd.DataFrame(rows)
+    combined_summary_path = summary_dir / "summary_metrics.csv"
+    write_combined_summary(combined_summary_path, rows, args.collision_gap_m)
 
-    preferred = [
-        "file", "script", "date", "description",
-        "acc_target_kph", "lead_target_kph",
-        "duration_s",
-        "ego_speed_mean_kph", "ego_speed_max_kph",
-        "lead_speed_mean_kph", "lead_speed_max_kph",
-        "gap_mean_m", "gap_min_m",
-        "headway_mean_s", "headway_min_s",
-        "rel_speed_rms_kph",
-        "ego_accel_peak_mps2", "ego_max_decel_mps2", "ego_jerk_peak_mps3",
-        "ttc_proxy_min_s",
-        "ego_overshoot_kph", "ego_steady_state_abs_error_kph",
-        "ego_stop_time_s",
-        "collision_flag"
-    ]
-    cols = [c for c in preferred if c in out_df.columns] + [c for c in out_df.columns if c not in preferred]
-    out_df = out_df[cols]
-
-    summary_path = summary_dir / "summary_metrics.csv"
-    with summary_path.open("w", encoding="utf-8", newline="") as f:
-        f.write("# BeamNG.tech experiment summary metrics\n")
-        f.write("# Generated by analyze_runs.py\n")
-        f.write(f"# collision_gap_m = {args.collision_gap_m}\n")
-        out_df.to_csv(f, index=False)
-
-    print(f"Wrote: {summary_path}\n")
-    print(out_df.to_string(index=False))
+    print(f"Wrote combined summary: {combined_summary_path}")
+    print(f"Wrote per-run summaries: {processed}")
+    if args.make_plots:
+        print(f"Wrote plots to: {plots_dir}")
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ EGO_AI_SPEED_LIMIT_KPH = 120.0
 # -----------------------------
 DT = 0.1
 EGO_START_DELAY_S = 5.0
-MAX_TIME_S = 90.0
+MAX_TIME_S = 75.0
 
 # -----------------------------
 # DEBUG PRINTS
@@ -43,7 +43,7 @@ ACTUATION_PRINT_EVERY_S = 1.0
 
 
 # Scenario A: lead speed step (baseline follow)
-LEAD_SPEED_STEP_AT_S = 30.0            # at t=30s, lead goes 60->70. Set None to disable.
+LEAD_SPEED_STEP_AT_S = 35.0            # at t=30s, lead goes 60->70. Set None to disable.
 
 # =========================================================
 # Helpers
