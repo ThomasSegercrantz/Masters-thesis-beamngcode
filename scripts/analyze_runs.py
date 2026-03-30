@@ -24,6 +24,8 @@ Optional:
   python scripts/analyze_runs.py --raw_dir results/raw --summary_dir results/summary
 """
 
+from __future__ import annotations
+
 import argparse
 import math
 from pathlib import Path
@@ -65,7 +67,116 @@ def safe_stem(path: Path) -> str:
     return s
 
 
-def compute_metrics(df: pd.DataFrame, meta: dict, collision_gap_m: float) -> dict:
+def scenario_prefix_from_name(name: str) -> str:
+    """
+    Example:
+      22_hard_brake_20260323_131250 -> 22_hard_brake
+    """
+    parts = name.split("_")
+    if len(parts) >= 3:
+        return "_".join(parts[:3])
+    return name
+
+
+def should_trim_post_stop_restart(csv_path: Path) -> bool:
+    """
+    Apply trimming only to scenarios where reverse motion after stopping
+    contaminates the performance metrics.
+    """
+    prefix = scenario_prefix_from_name(csv_path.stem)
+    return prefix in {"22_hard_brake", "25_gradual_stop"}
+
+
+def find_post_stop_restart_cutoff(
+    df: pd.DataFrame,
+    move_threshold_mps: float = 5.0,
+    stop_threshold_mps: float = 0.5,
+    restart_threshold_mps: float = 0.5,
+    stop_consecutive_samples: int = 3,
+) -> tuple[int | None, float | None]:
+    """
+    Finds the first frame where the ego starts moving again after having:
+      1) moved initially
+      2) come to a stop
+
+    This is intended to exclude simulator reverse motion after a collision or
+    after the vehicle has already come to rest.
+
+    Returns:
+      cutoff_idx, cutoff_time_s
+
+    If no cutoff is found, returns (None, None).
+
+    Logic:
+    - detect that the ego has been moving (> move_threshold_mps)
+    - find the first sustained stop (< stop_threshold_mps for N consecutive samples)
+    - after that stop, find the first frame where speed rises again (> restart_threshold_mps)
+    - use that first restart frame as cutoff
+    """
+    ego_speed = df["ego_speed_mps"].to_numpy(dtype=float)
+    time_s = df["time_s"].to_numpy(dtype=float)
+
+    # Must have moved at some point first
+    moving_idx = np.where(ego_speed > move_threshold_mps)[0]
+    if moving_idx.size == 0:
+        return None, None
+
+    start_search_idx = moving_idx[0]
+
+    # Find first sustained stop after initial motion
+    stop_start_idx = None
+    consec = 0
+    for i in range(start_search_idx, len(ego_speed)):
+        if ego_speed[i] < stop_threshold_mps:
+            consec += 1
+            if consec >= stop_consecutive_samples:
+                stop_start_idx = i - stop_consecutive_samples + 1
+                break
+        else:
+            consec = 0
+
+    if stop_start_idx is None:
+        return None, None
+
+    # Find first restart after that stop
+    for i in range(stop_start_idx + stop_consecutive_samples, len(ego_speed)):
+        if ego_speed[i] > restart_threshold_mps:
+            return i, float(time_s[i])
+
+    return None, None
+
+
+def trim_evaluation_window(csv_path: Path, df: pd.DataFrame) -> tuple[pd.DataFrame, bool, float | None]:
+    """
+    Returns:
+      df_eval, trim_applied, cutoff_time_s
+
+    For hard brake and gradual stop scenarios:
+      trim at the first frame where ego starts moving again after first stopping.
+
+    For all other scenarios:
+      return full dataframe unchanged.
+    """
+    if not should_trim_post_stop_restart(csv_path):
+        return df.copy(), False, None
+
+    cutoff_idx, cutoff_time_s = find_post_stop_restart_cutoff(df)
+    if cutoff_idx is None:
+        return df.copy(), False, None
+
+    # Exclude the first restart frame itself from evaluation
+    df_eval = df.iloc[:cutoff_idx].copy()
+    return df_eval, True, cutoff_time_s
+
+
+def compute_metrics(
+    df: pd.DataFrame,
+    meta: dict,
+    collision_gap_m: float,
+    raw_duration_s: float | None = None,
+    trim_applied: bool = False,
+    cutoff_time_s: float | None = None,
+) -> dict:
     out = {}
     out["file"] = meta.get("File", "")
     out["script"] = meta.get("Script", "")
@@ -85,7 +196,11 @@ def compute_metrics(df: pd.DataFrame, meta: dict, collision_gap_m: float) -> dic
     out["acc_target_kph"] = acc_target_kph
     out["lead_target_kph"] = lead_target_kph
 
-    out["duration_s"] = float(df["time_s"].max())
+    out["raw_duration_s"] = float(raw_duration_s) if raw_duration_s is not None else float(df["time_s"].max())
+    out["eval_duration_s"] = float(df["time_s"].max())
+    out["duration_s"] = out["eval_duration_s"]  # keep legacy column name
+    out["trim_applied"] = bool(trim_applied)
+    out["analysis_cutoff_time_s"] = float(cutoff_time_s) if cutoff_time_s is not None else float("nan")
 
     ego_kph = df["ego_speed_mps"] * 3.6
     lead_kph = df["lead_speed_mps"] * 3.6
@@ -177,7 +292,8 @@ def ordered_summary_df(rows: list[dict]) -> pd.DataFrame:
     preferred = [
         "file", "script", "date", "description",
         "acc_target_kph", "lead_target_kph",
-        "duration_s",
+        "raw_duration_s", "eval_duration_s", "duration_s",
+        "trim_applied", "analysis_cutoff_time_s",
         "ego_speed_mean_kph", "ego_speed_max_kph", "ego_speed_min_kph",
         "lead_speed_mean_kph", "lead_speed_max_kph", "lead_speed_min_kph",
         "gap_mean_m", "gap_min_m", "gap_max_m",
@@ -272,18 +388,28 @@ def main():
         meta["File"] = csv_path.name
 
         try:
-            df = pd.read_csv(csv_path, comment="#")
+            df_raw = pd.read_csv(csv_path, comment="#")
         except Exception as e:
             print(f"[WARN] Failed to read {csv_path}: {e}")
             continue
 
         required = {"time_s", "ego_speed_mps", "ego_accel_mps2", "lead_speed_mps", "gap_m", "relative_speed_mps"}
-        missing = required - set(df.columns)
+        missing = required - set(df_raw.columns)
         if missing:
             print(f"[WARN] Skipping {csv_path.name}: missing required columns {missing}")
             continue
 
-        metrics = compute_metrics(df, meta, collision_gap_m=args.collision_gap_m)
+        raw_duration_s = float(df_raw["time_s"].max())
+        df_eval, trim_applied, cutoff_time_s = trim_evaluation_window(csv_path, df_raw)
+
+        metrics = compute_metrics(
+            df_eval,
+            meta,
+            collision_gap_m=args.collision_gap_m,
+            raw_duration_s=raw_duration_s,
+            trim_applied=trim_applied,
+            cutoff_time_s=cutoff_time_s,
+        )
         rows.append(metrics)
         processed += 1
 
@@ -294,7 +420,8 @@ def main():
         if args.make_plots:
             plot_path = plots_dir / f"{run_name}.png"
             try:
-                make_run_plot(df, metrics, plot_path)
+                # keep plots based on raw data, as requested
+                make_run_plot(df_raw, metrics, plot_path)
             except Exception as e:
                 print(f"[WARN] Failed to plot {csv_path.name}: {e}")
 
